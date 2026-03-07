@@ -1,3 +1,4 @@
+import math
 import torchvision
 import random
 import numpy as np
@@ -131,6 +132,9 @@ class Scale_2d(Abstract_transformer):
     '''
         Given PIL image, enforce its some set size
         (can use for down sampling / keep full res)
+
+        Emits a warning when the source aspect ratio differs from the target
+        by more than 5 %, because the resize will distort the image.
     '''
 
     def __init__(self, args, kwargs):
@@ -138,19 +142,68 @@ class Scale_2d(Abstract_transformer):
         assert len(kwargs.keys()) == 0
         width, height = args.img_size
         self.set_cachable(width, height)
+        self.target_width = width
+        self.target_height = height
         self.transform = torchvision.transforms.Resize((height, width))
 
     def __call__(self, img, additional=None):
+        src_w, src_h = img.size
+        if src_w > 0 and src_h > 0:
+            src_ar = src_h / src_w
+            tgt_ar = self.target_height / self.target_width
+            if not math.isclose(src_ar, tgt_ar, rel_tol=0.05):
+                warnings.warn(
+                    "scale_2d: source aspect ratio {:.4f} ({:d}x{:d}) differs "
+                    "from target aspect ratio {:.4f} ({:d}x{:d}) by more than 5%%. "
+                    "The image will be distorted. Consider using "
+                    "scale_2d_with_fixed_aspect_ratio instead.".format(
+                        src_ar, src_w, src_h,
+                        tgt_ar, self.target_width, self.target_height,
+                    )
+                )
         return self.transform(img.convert('I'))
 
 @RegisterImageTransformer("scale_2d_with_fixed_aspect_ratio")
 class Scale_2d_With_Fixed_Aspect_Ratio(Abstract_transformer):
     '''
-        Given PIL image, enforce its some set size
-        (can use for down sampling / keep full res)
+    Pad (or crop) a PIL image to match the target aspect ratio, then scale it
+    to the exact target size.
 
-        Does it in 3 steps:
-        1) determine if left or right (similar to align left)
+    Algorithm
+    ---------
+    1. Compute the width the image *should* have given its current height and
+       the target aspect ratio.  Use ``round()`` so that the resulting integer
+       is as close as possible to the true floating-point value (avoids the
+       off-by-one error that ``int()`` truncation causes).
+    2. Detect which side of the image carries less content by zeroing out the
+       outermost 1/4-width strip on each side and comparing pixel sums.
+       Masks are created at the *input* image's own dimensions so the 25%
+       threshold is always applied to the actual image, not the target image.
+    3a. If the image is too narrow (expected_width > width): pad the
+        background/empty side so no breast tissue is cropped.
+    3b. If the image is too wide  (expected_width < width): crop from the
+        background/empty side for the same reason.
+    4. Assert (with a float tolerance) that the padded/cropped image has the
+       correct aspect ratio, then scale to the target resolution.
+
+    Previous bugs fixed
+    -------------------
+    * ``int()`` truncation of ``expected_width`` replaced by ``round()``
+      (truncation produced a width that changed the aspect ratio, making the
+      post-pad assertion always fail for non-trivial heights).
+    * Exact float equality assertion ``new_ar == self.aspect_ratio`` replaced
+      by ``math.isclose(..., rel_tol=2e-3)`` (integer rounding means the
+      ratio is never exactly the same float).
+    * Masks were created once in ``__init__`` at ``args.img_size`` (the
+      *target* size).  Applied to an input image of a different size, PIL
+      clips the paste to the destination bounds, so the effective zeroed strip
+      was only a tiny fraction of the input image width instead of the
+      intended 25 %.  Masks are now built dynamically inside ``__call__``
+      using ``img.size``.
+    * Padding direction was inverted: the original code padded on the
+      *breast* side instead of the *background* side.  When
+      ``right_sum > left_sum`` the breast is on the LEFT, so padding (or
+      cropping) should be applied to the RIGHT.
     '''
 
     def __init__(self, args, kwargs):
@@ -160,42 +213,75 @@ class Scale_2d_With_Fixed_Aspect_Ratio(Abstract_transformer):
         self.set_cachable(width, height)
 
         self.aspect_ratio = float(height) / float(width)
-
         self.scale_transform = torchvision.transforms.Resize((height, width))
 
-        # Create black image
-        mask_r = Image.new('1', args.img_size)
-        # Paint right side in white
-        mask_r.paste(1, ((mask_r.size[0] *3 // 4), 0, mask_r.size[0],
-                         mask_r.size[1]))
+    # ------------------------------------------------------------------
+    # Helper: detect which side of an image has more pixel content
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _content_side(img):
+        '''Return ``'left'`` or ``'right'`` for the side that carries more
+        pixel content (i.e. where the breast is).
+
+        Zeroes out the outermost 25 % strip on each side and compares the
+        remaining pixel sums.  Masks are built at *img.size* so the 25 %
+        threshold is applied relative to the actual image width.
+        '''
+        img_w, img_h = img.size
+        # three_quarters_x is the x-coordinate at which the rightmost 1/4 begins.
+        three_quarters_x = img_w * 3 // 4
+        black = Image.new('I', img.size)
+
+        # mask_r: rightmost 1/4 is white (paste will zero that strip)
+        mask_r = Image.new('1', img.size)
+        mask_r.paste(1, (three_quarters_x, 0, img_w, img_h))
+        # mask_l: leftmost 1/4 is white
         mask_l = mask_r.transpose(Image.FLIP_LEFT_RIGHT)
 
-        self.mask_r = mask_r
-        self.mask_l = mask_l
-        self.black = Image.new('I', args.img_size)
+        left = img.copy()
+        left.paste(black, mask=mask_l)   # zero left strip → sum of right 3/4
+        left_sum = np.array(left.getdata()).sum()
+
+        right = img.copy()
+        right.paste(black, mask=mask_r)  # zero right strip → sum of left 3/4
+        right_sum = np.array(right.getdata()).sum()
+
+        # right_sum measures left-3/4 content; left_sum measures right-3/4 content
+        return 'left' if right_sum > left_sum else 'right'
 
     def __call__(self, img, additional=None):
         width, height = img.size
-        expected_width = int( height / self.aspect_ratio)
+        # Use round() to get the nearest integer width for the target ratio.
+        expected_width = round(height / self.aspect_ratio)
+
         if expected_width != width:
-            assert width < expected_width
+            heavy_side = self._content_side(img)
             pad_delta = expected_width - width
-            left_pad = (pad_delta, 0, 0, 0)
-            right_pad = (0, 0, pad_delta, 0)
-            # Figure out if pad left or right.
-            left = img.copy()
-            left.paste(self.black, mask = self.mask_l)
-            left_sum = np.array(left.getdata()).sum()
-            right = img.copy()
-            right.paste(self.black, mask = self.mask_r)
-            right_sum = np.array(right.getdata()).sum()
-            if right_sum > left_sum:
-                pad = left_pad
+
+            if pad_delta > 0:
+                # Image is too narrow: pad the background (empty) side.
+                if heavy_side == 'left':
+                    # Breast on LEFT → background on RIGHT → pad RIGHT
+                    img = ImageOps.expand(img, (0, 0, pad_delta, 0))
+                else:
+                    # Breast on RIGHT → background on LEFT → pad LEFT
+                    img = ImageOps.expand(img, (pad_delta, 0, 0, 0))
             else:
-                pad = right_pad
-            img = ImageOps.expand(img, pad)
+                # Image is too wide: crop the background (empty) side.
+                crop_delta = -pad_delta
+                if heavy_side == 'left':
+                    # Breast on LEFT → remove background from RIGHT
+                    img = img.crop((0, 0, width - crop_delta, height))
+                else:
+                    # Breast on RIGHT → remove background from LEFT
+                    img = img.crop((crop_delta, 0, width, height))
+
             new_aspect_ratio = float(img.size[1]) / img.size[0]
-            assert new_aspect_ratio == self.aspect_ratio
+            assert math.isclose(new_aspect_ratio, self.aspect_ratio, rel_tol=2e-3), (
+                "Aspect ratio {:.4f} after padding/cropping does not match "
+                "target {:.4f}".format(new_aspect_ratio, self.aspect_ratio)
+            )
+
         return self.scale_transform(img)
 
 
